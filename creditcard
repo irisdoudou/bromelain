@@ -1,0 +1,166 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Oct 25 16:15:14 2019
+
+@author: Iris Dou
+"""
+#信用卡欺诈案例 bagging算法  弱分类器的集合
+# 数据读取与计算
+import pandas as  pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 数据预处理与模型选择
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import KFold
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import confusion_matrix, precision_recall_curve, auc, roc_auc_score, roc_curve, recall_score, classification_report
+import itertools
+# 随机森林与SVM
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from scipy import stats
+
+import warnings
+warnings.filterwarnings("ignore")
+
+# 一些基本参数设定
+mode = 2        #投票个数阈值
+ratio = 1       #负样本倍率
+iteration1 = 1  #总流程循环次数
+show_best_c = True  #是否显示最优超参数
+show_bdry = True    #是否显示决策边界
+
+data=pd.read_csv("D:\Downloads\creditcard.csv")
+data.drop('Time',axis=1,inplace=True)
+
+
+#数据下采样：数据集中正样本和负样本的比例严重失调，处理数据使得正样本和负样本的数量基本均等，这样的模型泛化能力才会高。
+#欺诈类的样本下标
+fraud_indices=np.array(data[data.Class==1].index)  #下标的一列
+#进行随机排列
+np.random.shuffle(fraud_indices)
+fraud_indices.shape #492
+#获取正常样本下标
+normal_indices=np.array(data[data.Class==0].index)
+np.random.shuffle(normal_indices)
+normal_indices.shape#284315
+
+#划分训练集和测试集  #用train_test_split划分得到的结果是对应的
+#train_test_split好像不支持xy个数不同 那就分别做一次
+train_normal_indices,ff,test_normal_indices,ff=train_test_split(normal_indices,normal_indices)
+nn,train_fraud_indices,nn,test_fraud_indices=train_test_split(fraud_indices,fraud_indices)
+##合并测试集
+test_indices=np.concatenate([test_normal_indices,test_fraud_indices])
+type(test_indices) #ndarray
+#通过下标选取测试集数据，[表示选取行,表示选取列]
+test_data=data.iloc[test_indices,:]  #
+test_data.shape
+x_test=test_data.ix[:,test_data.columns != 'Class'] #选取指标列
+y_test=test_data.ix[:,test_data.columns == 'Class']  #选取结果列
+#注意 对于测试集是不需要下采样的 因为我们要看他在真实数据集上的结果
+
+#数据下采样，调用下采样函数 getTrainingSample
+x_train_undersample,y_train_undersample,train_normal_pos=getTrainingSample(
+train_fraud_indices,train_normal_indices,data,0,ratio)
+
+
+
+
+#下采样函数
+# indices存储的是数据的下标
+def getTrainingSample(train_fraud_indices, train_normal_indices, data, train_normal_pos,ratio):
+    train_number_records_fraud= int(ratio*len(train_fraud_indices))
+    train_number_records_normal= len(train_normal_indices)     #输出正反例个数
+    # 数据下采样 pos可能是一个位置 用于选正例
+    if train_normal_pos + train_number_records_fraud <= train_number_records_normal:  #反例小于正例
+        small_train_normal_indices = train_normal_indices[train_normal_pos: train_normal_pos+train_number_records_fraud]  #取一个从位置数开始的和反例一样大小的indices
+        train_normal_pos = train_normal_pos + train_number_records_fraud    #更新位置 取到后面 保证这个再也选不到了   
+    # 数据上采样
+    else:
+        small_train_normal_indices = np.concatenate([train_normal_indices[train_normal_pos: train_number_records_normal], 
+                                            train_normal_indices[0: train_normal_pos + train_number_records_fraud - train_number_records_normal]])
+        train_normal_pos = train_normal_pos+train_number_records_fraud - train_number_records_normal
+    # 进行数据下标合并，并打乱
+    under_train_sample_indices = np.concatenate([train_fraud_indices, small_train_normal_indices])
+    np.random.shuffle(under_train_sample_indices)
+    #下采样
+    under_train_sample_data = data.iloc[under_train_sample_indices,:]#定位
+    x_train_undersample = under_train_sample_data.ix[:,under_train_sample_data.columns != 'Class']  #非class列
+    y_train_undersample = under_train_sample_data.ix[:,under_train_sample_data.columns == 'Class']
+    # 返回的是已经进行过采样的特征和目标特征
+    return x_train_undersample,y_train_undersample,train_normal_pos
+
+#用不同的模型进行训练
+models_dict = {'knn' : knn_module, 'svm_rbf': svm_rbf_module, 'svm_poly': svm_poly_module,
+'lr': lr_module, 'rf': rf_module}
+
+#knn中取不同的k值(超参数)
+c_param_range_knn=[3,5,7,9]
+#自定义cross_validation_recall，使用循环找出最适合的超参数。
+best_c_knn=cross_validation_recall(x,y, c_param_range_knn,models_dict, 'knn')
+
+
+#cross_validation_recall如下
+def cross_val_recall(x_train_data,y_train_data,c_param_range,model_dict,model_name):
+    fold=KFold(5,shuffle=False)
+    results_table = pd.DataFrame(index= range(len(c_param_range),2), columns = ['C_parameter','Mean recall score'])  #结果表
+    results_table['C_parameter'] = c_param_range #输入
+    recall_mean=[]
+    #循环使用每个超参数
+    for c_param in c_param_range:
+        recall_aucs=[]
+        for i,train_index in enumerate(fold.split(y_train_data)):
+     # 模型训练
+            y_pred_undersample= models_dict[model_name](x_train_data,y_train_data, train_index, c_param)
+    # 计算召回率和ROC曲线\n",
+            recall_auc, _=compute_recall_and_auc(y_train_data.iloc[train_index[1],:].values,y_pred_undersample)
+            print(model_name,'第',i,'次：',recall_auc)
+            recall_aucs.append(recall_auc)
+    # auc取平均值作为这组超参数的分数
+    recall_mean.append(np.mean(recall_aucs))
+    results_table['Mean recall score'] = recall_mean
+    # 得分最大的一组作为最优超参数，并返回
+    best_c = results_table.loc[results_table['Mean recall score'].idxmax()]['C_parameter']
+    return best_c
+        
+
+
+def knn_module(x,y,indices, c_param, bdry=None):
+    #超参数赋值
+    knn=KNeighborsClassifier(n_neighbors=c_param)
+    #ravel把数组变平
+    knn.fit(x.iloc[indices[0],:], y.iloc[indices[0],:].values.ravel())
+    y_pred_undersample = knn.predict(x.iloc[indices[1],:].values)
+    
+    return y_pred_undersample
+
+#计算召回率和auc
+#y_t是真实值，y_p是预测值
+def compute_recall_and_auc(y_t, y_p):
+    cnf_matrix=confusion_matrix(y_t,y_p)
+    #设置numpy的打印精度
+    np.set_printoptions(precision=2)
+    recall_score = cnf_matrix[0,0]/(cnf_matrix[1,0]+cnf_matrix[0,0]) 
+    #Roc曲线
+    fpr, tpr,thresholds = roc_curve(y_t,y_p)
+    roc_auc= auc(fpr,tpr)
+    return recall_score , roc_auc
+
+c_param_range_svm_rbf=[0.01,0.1,1,10,100]
+best_c_svm_rbf = cross_validation_recall(x,y,c_param_range_svm_rbf, models_dict, 'svm_rbf')
+
+def svm_rbf_module(x, y, indices, c_param, bdry= 0.5):
+    svm_rbf = SVC(C=c_param, probability=True)
+    svm_rbf.fit(x.iloc[indices[0],:], y.iloc[indices[0],:].values.ravel())
+    y_pred_undersample = svm_rbf.predict_proba(x.iloc[indices[1],:].values)[:,1] >= bdry#True/Flase
+    return y_pred_undersample
+
+def svm_poly_module(x,y, indices, c_param, bdry=0.5):
+    svm_poly=SVC(C=c_param[0], kernel='poly', degree= c_param[1], probability=True)
+    svm_poly.fit(x.iloc[indices[0],:], y.iloc[indices[0],:].values.ravel())
+    y_pred_undersample = svm_poly.predict_proba(x.iloc[indices[1],:].values)[:,1] >= bdry
+    return y_pred_undersample
